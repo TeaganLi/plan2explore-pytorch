@@ -8,13 +8,15 @@ from torch.distributions.kl import kl_divergence
 from torch.nn import functional as F
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
-from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher
+from env import CONTROL_SUITE_ENVS, Env, GYM_ENVS, EnvBatcher, preprocess_observation_
 from memory import ExperienceReplay
 from models import bottle, Encoder, ObservationModel, RewardModel, TransitionModel, ValueModel, ActorModel, OneStepModel
 from planner import MPCPlanner
 from utils import lineplot, write_video, imagine_ahead, lambda_return, compute_intrinsic_reward, FreezeParameters, ActivateParameters
 from tensorboardX import SummaryWriter
 
+from mujoco_py import GlfwContext
+GlfwContext(offscreen=True)  # Create a window to init GLFW.
 
 # Hyperparameters
 parser = argparse.ArgumentParser(description='PlaNet, Dreamer or plan2explore')
@@ -158,11 +160,14 @@ if args.models is not '' and os.path.exists(args.models):
   encoder.load_state_dict(model_dicts['encoder'])
   model_optimizer.load_state_dict(model_dicts['model_optimizer'])
   if args.algo=="dreamer" or args.algo=="p2e":
+    model_dicts = torch.load(args.models.replace("models", "actorvalue_models"))
     actor_model.load_state_dict(model_dicts['actor_model'])
     value_model.load_state_dict(model_dicts['value_model'])
   if args.algo=="p2e":
+    model_dicts = torch.load(args.models.replace("models", "curious_models"))
     curious_actor_model.load_state_dict(model_dicts['curious_actor_model'])
     curious_value_model.load_state_dict(model_dicts['curious_value_model'])
+    model_dicts = torch.load(args.models.replace("models", "onestep_models"))
     onestep_optimizer.load_state_dict(model_dicts['onestep_optimizer'])
 if args.algo=="dreamer":
   print("DREAMER")
@@ -193,6 +198,7 @@ def update_belief_and_act(args, env, planner, transition_model, encoder, belief,
 
 # Testing only
 if args.test:
+  import cv2
   # Set models to eval mode
   # uses normal actor for testing only case
   transition_model.eval()
@@ -200,18 +206,44 @@ if args.test:
   encoder.eval()
   with torch.no_grad():
     total_reward = 0
-    for _ in tqdm(range(args.test_episodes)):
+    video_frames = []
+    for idx_epi in tqdm(range(args.test_episodes)):
       observation = env.reset()
+      obs = env._env.render(mode='rgb_array')
+      video_frames.append([obs])
       belief, posterior_state, action = torch.zeros(1, args.belief_size, device=args.device), torch.zeros(1, args.state_size, device=args.device), torch.zeros(1, env.action_size, device=args.device)
       pbar = tqdm(range(args.max_episode_length // args.action_repeat))
       for t in pbar:
         belief, posterior_state, action, observation, reward, done = update_belief_and_act(args, env, planner, transition_model, encoder, belief, posterior_state, action, observation.to(device=args.device))
         total_reward += reward
+        obs = env._env.render(mode='rgb_array')
+        # cv2.imshow("env", obs)
+        # cv2.waitKey()
+        # cv2.destroyAllWindows()
+        video_frames[idx_epi].append(obs)
         if args.render:
           env.render()
         if done:
+          video_frames[idx_epi].extend([obs] * (args.max_episode_length // args.action_repeat - t))
           pbar.close()
           break
+
+    # concate videos
+    video = []
+    for t in range(args.max_episode_length // args.action_repeat):
+      obs = []
+      for f in video_frames:
+        image =  torch.tensor(cv2.resize(f[t], (256, 256), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1), dtype=torch.float32)  # Resize and put channel first
+        preprocess_observation_(image, 5)
+        image = image.unsqueeze(dim=0)
+        # print(image.size())
+        obs.append(image)
+      # obs = tuple(obs)
+      # print(len(obs), obs[0].size())
+      obs = torch.cat(obs)
+      video.append(make_grid(obs + 0.5, nrow=3).numpy())
+    write_video(video, 'test_episode', results_dir)  # Lossy compression
+    save_image(torch.as_tensor(video[-1]), os.path.join(results_dir, 'test_episode.png'))
   print('Average Reward:', total_reward / args.test_episodes)
   env.close()
   quit()
